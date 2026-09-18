@@ -36,13 +36,13 @@
 │  (cards, gallery,      │  POST /api/chat  ────────►  ┌─┴──────────────────────┐
 │   booking, tracker)    │  POST /api/orders/confirm    │  BE — Fastify (TS)     │
 └────────────────────────┘                              │  Agent service         │
-                                                        │  @anthropic-ai/sdk     │
-                                                        │  toolRunner + tools    │
+                                                        │  @openai/agents        │
+                                                        │  Runner + zod tools    │
                                                         └─┬───────────┬─────────┘
                                                           │           │
                                               ┌───────────┴──┐   ┌────┴─────────┐
-                                              │ PostgreSQL   │   │ Claude API   │
-                                              │ (Prisma)     │   │ claude-opus-5│
+                                              │ PostgreSQL   │   │ OpenAI API   │
+                                              │ (Prisma)     │   │ gpt-5.1      │
                                               │ menu/orders/ │   └──────────────┘
                                               │ inventory/   │
                                               │ reservations │
@@ -54,8 +54,8 @@
 | Layer | Choice | Why |
 |---|---|---|
 | Backend | Node 22 + Fastify + TypeScript | Fast, typed, first-class SSE support |
-| Agent | `@anthropic-ai/sdk` beta **toolRunner** (`betaZodTool`) | SDK drives the tool loop; Zod gives typed tool inputs for free |
-| Model | `claude-opus-5`, adaptive thinking (default), `effort: "medium"` | Conversational concierge; medium balances latency/cost. Streaming always on |
+| Agent | `@openai/agents` Agents SDK (`tool()` + zod v4) | SDK drives the tool loop; Zod gives typed tool inputs for free |
+| Model | `OPENAI_MODEL` env (default `gpt-5.1`) | Conversational concierge; swappable per env. Streaming always on |
 | DB | PostgreSQL + Prisma | Relational fits menu/orders/inventory; Prisma = typed queries |
 | Realtime | SSE (two channels: agent stream, kitchen events) | Simpler than WebSocket; one-directional is all we need |
 | Frontend | Next.js 15 (App Router) + Tailwind + shadcn/ui | Team standard; server components for menu pages, client chat |
@@ -66,6 +66,8 @@ Tools return structured JSON. The BE forwards two SSE event types to the FE:
 
 - `text_delta` — streamed agent prose
 - `ui_block` — typed payloads the FE renders as rich widgets (`menu_card`, `photo_gallery`, `order_draft`, `reservation_slot_picker`, `kitchen_tracker`, `nutrition_table`, `stock_warning`)
+
+Plus two control events: `done` (clean terminal signal) and `error` (stream-level failure) — content-bearing events remain the two above.
 
 The agent narrates; the widgets do the heavy lifting. No markdown-table menus in chat.
 
@@ -168,6 +170,16 @@ model RestaurantInfo {                     // hours, chef bio, policies — edit
   key   String @id                         // "hours", "chef_bio", "address", "policies"
   value Json
 }
+
+model ConversationTurn {                   // per-session agent history (raw SDK items)
+  id        String   @id @default(cuid())
+  sessionId String                         // anonymous sid cookie; Customer FK arrives in P2
+  index     Int                            // strict per-session ordering
+  role      TurnRole                       // USER | ASSISTANT
+  content   Json                           // raw agent history item (incl. tool calls/results)
+  createdAt DateTime @default(now())
+  @@unique([sessionId, index])
+}
 ```
 
 ---
@@ -203,26 +215,23 @@ All tools defined with `betaZodTool`. Read tools execute freely; **write tools a
 
 ```ts
 // agent/runner.ts (shape, not final code)
-const runner = client.beta.messages.toolRunner({
-  model: "claude-opus-5",
-  max_tokens: 64000,
-  stream: true,
-  output_config: { effort: "medium" },
-  system: [
-    { type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
-  ],
+const agent = new Agent({
+  name: "MARGOT",
+  model: env.OPENAI_MODEL,           // default gpt-5.1
+  instructions: SYSTEM_PROMPT,       // frozen constant
   tools: [getMenu, getItemDetails, getRestaurantInfo, getPhotos,
           checkAvailability, planMeal, getCustomerProfile,
           saveCustomerNote, draftOrder, updateDraftOrder,
           draftReservation, getOrderStatus],
-  messages: conversationHistory,
 });
+const result = await runner.run(agent, historyItems, { stream: true, maxTurns: 8, signal });
+// text deltas: raw_model_stream_event → output_text_delta → SSE text_delta
+// persistence: result.history → ConversationTurn rows
 ```
 
-- **Prompt caching:** frozen system prompt + deterministic tool order, breakpoint on the last system block. Session context (customer name, allergies, time of day) is injected as the **first user turn**, never interpolated into the system prompt — keeps the prefix byte-stable.
-- **Multi-turn cache:** `cache_control` on the last content block of the latest turn.
-- **Streaming:** always (`stream: true`); text deltas piped to the FE SSE channel as they arrive.
-- **History:** stored per session in Postgres (`ConversationTurn` table); full history resent each request (API is stateless).
+- **Prompt caching:** OpenAI caches automatically on stable prefixes — so the instructions stay a frozen constant and tool order is deterministic. Session context (customer name, allergies, time of day) is injected as the **first user turn** (persisted, index 0), never interpolated into the instructions — keeps the prefix byte-stable. Verify via `usage.inputTokensDetails.cached_tokens > 0` on turn 2+.
+- **Streaming:** always (`stream: true`); text deltas piped to the FE SSE channel as they arrive; tools `emit()` ui_blocks mid-run.
+- **History:** stored per session in Postgres (`ConversationTurn` table, one row per SDK history item); full history resent each request (API is stateless).
 
 ### System prompt (draft)
 
@@ -280,6 +289,8 @@ Arrival flow (F11): FE session boot calls `get_customer_profile` context → age
 
 Kitchen status updates come from a staff-facing endpoint (`PATCH /api/kitchen/orders/:id/stage`) — out of the agent's hands entirely.
 
+**Live stock propagation (86 flow):** when staff 86 an item (`POST /api/kitchen/menu-items/:id/86`) or inventory drops to LOW/OUT, the BE broadcasts a `stock_update` event on the kitchen SSE channel. The FE flips affected menu cards to "86 tonight"/"low" in active guest sessions without waiting for the next tool call; the agent still gets fresh stock on every `draft_order`.
+
 ### REST endpoints (non-agent)
 
 | Method | Path | Purpose |
@@ -287,8 +298,9 @@ Kitchen status updates come from a staff-facing endpoint (`PATCH /api/kitchen/or
 | `POST` | `/api/chat` | Send message → SSE stream (text deltas + ui_blocks) |
 | `POST` | `/api/orders/:id/confirm` | Human-approved commit |
 | `POST` | `/api/reservations/:id/confirm` | Human-approved commit |
-| `GET` | `/api/events/kitchen/:orderId` | SSE kitchen status channel |
+| `GET` | `/api/events/kitchen/:orderId` | SSE kitchen status channel (also carries `stock_update` events) |
 | `PATCH` | `/api/kitchen/orders/:id/stage` | Staff app updates cooking stage |
+| `POST` | `/api/kitchen/menu-items/:id/86` | Staff quick-action: mark item OUT, broadcast `stock_update` |
 | CRUD | `/api/admin/menu`, `/api/admin/inventory` | Staff menu/stock management |
 
 ---
@@ -381,8 +393,8 @@ kitchen tracker.
 |---|---|---|
 | P1 — Skeleton | Monorepo, Prisma schema + seed data, Fastify + `/api/chat` with toolRunner, read-only tools (menu, info, photos, nutrition), FE chat with `MenuCard`/`PhotoGallery`/`NutritionTable` | L |
 | P2 — Writes | Customer profiles + allergy notes, draft order/reservation tools, confirm endpoints, `OrderDraft`/`ReservationPicker` widgets, stock + allergen warnings | L |
-| P3 — Live kitchen | Kitchen SSE channel, staff stage endpoint, `KitchenTracker`, arrival-review flow | M |
-| P4 — Polish | Meal planner tool, vibe tagging pass on menu data, prompt-cache verification (`cache_read_input_tokens` > 0), eval set of 30 canned conversations, rate limiting, design pass from §8 winner | M |
+| P3 — Live kitchen | Kitchen SSE channel, staff stage endpoint, `KitchenTracker`, arrival-review flow, 86 quick-action + `stock_update` broadcast | M |
+| P4 — Polish | Meal planner tool, vibe tagging pass on menu data, prompt-cache verification (`cached_tokens` > 0), eval set of 30 canned conversations, rate limiting, design pass from §8 winner | M |
 
 **Out of scope (v1):** payments, loyalty program, voice, multi-restaurant tenancy, staff-side AI, SMS notifications.
 

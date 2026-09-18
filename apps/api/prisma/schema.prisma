@@ -1,0 +1,161 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum StockStatus {
+  IN_STOCK
+  LOW
+  OUT
+}
+
+enum OrderStatus {
+  DRAFT
+  CONFIRMED
+  QUEUED
+  COOKING
+  PLATING
+  SERVED
+  CANCELLED
+}
+
+enum ReservationStatus {
+  PENDING
+  CONFIRMED
+  SEATED
+  CANCELLED
+  NO_SHOW
+}
+
+enum TurnRole {
+  USER
+  ASSISTANT
+}
+
+model MenuCategory {
+  id        String     @id @default(cuid())
+  name      String     @unique
+  sortOrder Int
+  items     MenuItem[]
+}
+
+model MenuItem {
+  id          String               @id @default(cuid())
+  categoryId  String
+  category    MenuCategory         @relation(fields: [categoryId], references: [id])
+  name        String
+  description String
+  priceCents  Int
+  calories    Int
+  isSignature Boolean              @default(false)
+  vibeTags    String[]
+  spiceLevel  Int                  @default(0)
+  photoUrls   String[]
+  ingredients MenuItemIngredient[]
+  reviews     Review[]
+  inventory   InventoryItem?
+  orderItems  OrderItem[]
+}
+
+model Ingredient {
+  id                  String               @id @default(cuid())
+  name                String               @unique
+  allergens           String[]
+  caloriesPer100g     Int?
+  swappable           Boolean              @default(false)
+  lowCalAlternativeId String?
+  lowCalAlternative   Ingredient?          @relation("LowCalSwap", fields: [lowCalAlternativeId], references: [id])
+  swapTargets         Ingredient[]         @relation("LowCalSwap")
+  menuItems           MenuItemIngredient[]
+}
+
+model MenuItemIngredient {
+  menuItemId   String
+  ingredientId String
+  removable    Boolean    @default(false)
+  menuItem     MenuItem   @relation(fields: [menuItemId], references: [id])
+  ingredient   Ingredient @relation(fields: [ingredientId], references: [id])
+
+  @@id([menuItemId, ingredientId])
+}
+
+model InventoryItem {
+  menuItemId   String      @id
+  menuItem     MenuItem    @relation(fields: [menuItemId], references: [id])
+  status       StockStatus
+  qtyRemaining Int?
+}
+
+model Customer {
+  id           String        @id @default(cuid())
+  name         String?
+  phone        String?       @unique
+  allergies    String[]
+  notes        String[]
+  orders       Order[]
+  reservations Reservation[]
+}
+
+model Order {
+  id              String       @id @default(cuid())
+  customerId      String
+  customer        Customer     @relation(fields: [customerId], references: [id])
+  status          OrderStatus
+  items           OrderItem[]
+  specialRequests String[]
+  scheduledFor    DateTime?
+  reservationId   String?
+  reservation     Reservation? @relation(fields: [reservationId], references: [id])
+  createdAt       DateTime     @default(now())
+}
+
+model OrderItem {
+  id         String   @id @default(cuid())
+  orderId    String
+  order      Order    @relation(fields: [orderId], references: [id])
+  menuItemId String
+  menuItem   MenuItem @relation(fields: [menuItemId], references: [id])
+  qty        Int
+  modifiers  String[]
+}
+
+model Reservation {
+  id         String            @id @default(cuid())
+  customerId String
+  customer   Customer          @relation(fields: [customerId], references: [id])
+  partySize  Int
+  startsAt   DateTime
+  status     ReservationStatus
+  tableId    String?
+  orders     Order[]
+}
+
+model Review {
+  id         String   @id @default(cuid())
+  menuItemId String
+  menuItem   MenuItem @relation(fields: [menuItemId], references: [id])
+  rating     Int
+  text       String?
+  photoUrls  String[]
+}
+
+model RestaurantInfo {
+  key   String @id
+  value Json
+}
+
+model ConversationTurn {
+  id        String   @id @default(cuid())
+  sessionId String
+  index     Int
+  role      TurnRole
+  content   Json
+  createdAt DateTime @default(now())
+
+  @@unique([sessionId, index])
+  @@index([sessionId])
+}

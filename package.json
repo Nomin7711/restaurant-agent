@@ -1,0 +1,12 @@
+{
+  "name": "restaurant-agent",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --parallel --filter @solane/api --filter @solane/web dev",
+    "db:up": "docker compose up -d",
+    "db:migrate": "pnpm -F @solane/api exec prisma migrate dev",
+    "db:seed": "pnpm -F @solane/api exec prisma db seed",
+    "smoke": "bash scripts/smoke.sh",
+    "typecheck": "pnpm -r exec tsc --noEmit"
+  }
+}

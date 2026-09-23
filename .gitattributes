@@ -1,0 +1,3 @@
+# Design mockups are prototypes, not application code —
+# keep them out of GitHub's language statistics so the repo reads as TypeScript.
+design/** linguist-documentation
